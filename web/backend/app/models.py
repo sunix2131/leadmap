@@ -90,7 +90,6 @@ class CallLog(Base):
 
 class PortfolioCategory(Base):
     __tablename__ = "portfolio_categories"
-    __table_args__ = (Index("ix_portfolio_categories_slug", "slug"),)
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(150), nullable=False)
@@ -105,7 +104,6 @@ class PortfolioCategory(Base):
 
 class PortfolioProject(Base):
     __tablename__ = "portfolio_projects"
-    __table_args__ = (Index("ix_portfolio_projects_slug", "slug"),)
 
     id = Column(Integer, primary_key=True, index=True)
     category_id = Column(Integer, ForeignKey("portfolio_categories.id"), nullable=False)

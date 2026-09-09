@@ -24,6 +24,12 @@ def make_settings(**overrides: str) -> Settings:
     return Settings(**values)
 
 
+def test_schema_does_not_declare_duplicate_indexes() -> None:
+    from app.database import Base
+    names = [index.name for table in Base.metadata.tables.values() for index in table.indexes]
+    assert len(names) == len(set(names))
+
+
 def test_settings_reject_placeholder_secret() -> None:
     with pytest.raises(ValidationError, match="SECRET_KEY must be replaced"):
         make_settings(SECRET_KEY="generate-a-random-secret-before-starting")
