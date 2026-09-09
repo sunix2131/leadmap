@@ -1,14 +1,13 @@
 import asyncio
 import csv
-import json
 import sys
 from pathlib import Path
-from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from app.database import async_session, init_db
 from app.models import Lead
+from app.import_values import parse_csv_list, parse_scraped_at
 
 
 async def import_csv(csv_path: str):
@@ -26,26 +25,9 @@ async def import_csv(csv_path: str):
         with open(path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                categories = []
-                if row.get("categories"):
-                    try:
-                        categories = json.loads(row["categories"])
-                    except (json.JSONDecodeError, TypeError):
-                        categories = [c.strip() for c in row["categories"].split(",") if c.strip()]
-
-                social_links = []
-                if row.get("social_links"):
-                    try:
-                        social_links = json.loads(row["social_links"])
-                    except (json.JSONDecodeError, TypeError):
-                        social_links = [s.strip() for s in row["social_links"].split(",") if s.strip()]
-
-                scraped_at = None
-                if row.get("scraped_at"):
-                    try:
-                        scraped_at = datetime.fromisoformat(row["scraped_at"])
-                    except ValueError:
-                        pass
+                categories = parse_csv_list(row.get("categories"))
+                social_links = parse_csv_list(row.get("social_links"))
+                scraped_at = parse_scraped_at(row.get("scraped_at"))
 
                 lead = Lead(
                     name=row.get("name", "Без названия"),

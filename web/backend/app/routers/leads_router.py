@@ -8,6 +8,7 @@ from app.models import User, UserRole, Lead, LeadStatus, CallLog
 from app.schemas import LeadOut, LeadStatusUpdate, LeadAssign, LeadBatchImport
 from app.auth import get_current_user, require_admin
 from app.rate_limiter import rate_limiter
+from app.import_values import parse_scraped_at
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 
@@ -271,7 +272,7 @@ async def import_leads(
             hours=item.get("hours", ""),
             yandex_url=item.get("yandex_url", ""),
             source=item.get("source", "yandex_maps"),
-            scraped_at=datetime.fromisoformat(item["scraped_at"]) if item.get("scraped_at") else None,
+            scraped_at=parse_scraped_at(item.get("scraped_at")),
         )
         db.add(lead)
         imported += 1

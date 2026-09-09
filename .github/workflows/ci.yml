@@ -24,12 +24,27 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: leadcrm
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: leadcrm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U leadcrm -d leadcrm_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     defaults:
       run:
         working-directory: web/backend
     env:
       ENVIRONMENT: test
       DATABASE_URL: postgresql+asyncpg://leadcrm:test@localhost:5432/leadcrm
+      TEST_DATABASE_URL: postgresql+asyncpg://leadcrm:test@localhost:5432/leadcrm_test
       SECRET_KEY: 0123456789abcdef0123456789abcdef
       ADMIN_PASSWORD: correct-horse-battery-staple
     steps:

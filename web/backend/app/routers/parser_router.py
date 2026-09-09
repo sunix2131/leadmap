@@ -15,6 +15,7 @@ from app.auth import require_admin
 from app.models import User, Lead
 from app.config import settings
 from app.database import async_session
+from app.import_values import parse_csv_list, parse_scraped_at
 
 router = APIRouter(prefix="/api/parser", tags=["parser"])
 logger = logging.getLogger(__name__)
@@ -62,20 +63,15 @@ async def import_csv_leads(csv_files: list[Path]):
                     result = await db.execute(select(Lead).where(Lead.phone == phone).limit(1))
                     if result.scalars().first():
                         continue
-                    scraped_at = None
-                    if row.get("scraped_at"):
-                        try:
-                            scraped_at = datetime.fromisoformat(row["scraped_at"])
-                        except ValueError:
-                            pass
+                    scraped_at = parse_scraped_at(row.get("scraped_at"))
                     fields = {key: row.get(key) or "" for key in (
                         "name", "address", "email", "website", "website_platform",
                         "rating", "reviews", "hours", "yandex_url",
                     )}
                     db.add(Lead(
                         **fields, phone=phone,
-                        categories=[v.strip() for v in (row.get("categories") or "").split(",") if v.strip()],
-                        social_links=[v.strip() for v in (row.get("social_links") or "").split(",") if v.strip()],
+                        categories=parse_csv_list(row.get("categories")),
+                        social_links=parse_csv_list(row.get("social_links")),
                         website_status=row.get("website_status") or "unknown",
                         source="parser", scraped_at=scraped_at,
                     ))
