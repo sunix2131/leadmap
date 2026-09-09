@@ -1,12 +1,9 @@
 import asyncio
-import logging
-import subprocess
-import sys
-import threading
-import uuid
 import csv
-import glob
-from datetime import datetime
+import logging
+import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -14,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from app.auth import require_admin, get_current_user
+from app.auth import require_admin
 from app.models import User, Lead
 from app.config import settings
 from app.database import async_session
@@ -24,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 tasks = {}
 MAX_TASK_OUTPUT_CHARS = 200_000
+MAX_TASK_HISTORY = 100
+ACTIVE_STATUSES = {"pending", "running"}
 
 
 class ParserRunRequest(BaseModel):
@@ -41,191 +40,157 @@ class TaskResponse(BaseModel):
     output: Optional[str] = None
 
 
-async def import_csv_leads(parser_dir: Path):
-    csv_files = glob.glob(str(parser_dir / "out" / "*.csv"))
+def output_snapshot(parser_dir: Path) -> dict[Path, tuple[int, int]]:
+    result = {}
+    for path in (parser_dir / "out").glob("*.csv"):
+        stat = path.stat()
+        result[path] = (stat.st_mtime_ns, stat.st_size)
+    return result
 
-    for csv_file in csv_files:
-        try:
-            with open(csv_file, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
 
-            async with async_session() as db:
-                for row in rows:
-                    phone = row.get("phone", "")
-                    if not phone:
+async def import_csv_leads(csv_files: list[Path]):
+    # One transaction for this run: a failed import must not look completed.
+    async with async_session() as db:
+        seen_phones = set()
+        for csv_file in csv_files:
+            with csv_file.open("r", encoding="utf-8-sig", newline="") as source:
+                for row in csv.DictReader(source):
+                    phone = (row.get("phone") or "").strip()
+                    if not phone or phone in seen_phones:
                         continue
-
-                    result = await db.execute(
-                        select(Lead).where(Lead.phone == phone)
-                    )
-                    existing = result.scalar_one_or_none()
-                    if existing:
+                    seen_phones.add(phone)
+                    result = await db.execute(select(Lead).where(Lead.phone == phone).limit(1))
+                    if result.scalars().first():
                         continue
-
-                    categories = row.get("categories", "")
-                    if isinstance(categories, str):
-                        categories = [c.strip() for c in categories.split(",") if c.strip()]
-
-                    social_links = row.get("social_links", "")
-                    if isinstance(social_links, str):
-                        social_links = [s.strip() for s in social_links.split(",") if s.strip()]
-
                     scraped_at = None
                     if row.get("scraped_at"):
                         try:
                             scraped_at = datetime.fromisoformat(row["scraped_at"])
-                        except (ValueError, TypeError):
+                        except ValueError:
                             pass
-
-                    lead = Lead(
-                        name=row.get("name", ""),
-                        categories=categories,
-                        address=row.get("address", ""),
-                        phone=phone,
-                        email=row.get("email", ""),
-                        website=row.get("website", ""),
-                        website_status=row.get("website_status", "unknown"),
-                        website_platform=row.get("website_platform", ""),
-                        social_links=social_links,
-                        rating=row.get("rating", ""),
-                        reviews=row.get("reviews", ""),
-                        hours=row.get("hours", ""),
-                        yandex_url=row.get("yandex_url", ""),
-                        source="parser",
-                        scraped_at=scraped_at,
-                    )
-                    db.add(lead)
-
-                await db.commit()
-        except Exception:
-            logger.exception("Failed to import parser output from %s", csv_file)
+                    fields = {key: row.get(key) or "" for key in (
+                        "name", "address", "email", "website", "website_platform",
+                        "rating", "reviews", "hours", "yandex_url",
+                    )}
+                    db.add(Lead(
+                        **fields, phone=phone,
+                        categories=[v.strip() for v in (row.get("categories") or "").split(",") if v.strip()],
+                        social_links=[v.strip() for v in (row.get("social_links") or "").split(",") if v.strip()],
+                        website_status=row.get("website_status") or "unknown",
+                        source="parser", scraped_at=scraped_at,
+                    ))
+        await db.commit()
 
 
-def run_parser_task(task_id: str, query: str, location: str, limit: int, mode: str):
-    parser_dir = Path(settings.PARSER_DIR)
-    python_path = parser_dir / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
-    if not python_path.is_file():
-        tasks[task_id]["status"] = "error"
-        tasks[task_id]["output"] = f"Parser interpreter not found: {python_path}"
+async def terminate_process(process):
+    if process is None or process.returncode is not None:
         return
-
-    cmd = [
-        str(python_path),
-        "run.py",
-        mode,
-        "--query", query,
-        "--location", location,
-        "--limit", str(limit),
-    ]
-
-    tasks[task_id]["status"] = "running"
-
     try:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(parser_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+
+
+async def run_parser_task(task_id: str, query: str, location: str, limit: int, mode: str):
+    task = tasks[task_id]
+    process = None
+    try:
+        parser_dir = Path(settings.PARSER_DIR).resolve()
+        python_path = parser_dir / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+        if not python_path.is_file():
+            raise FileNotFoundError(f"Parser interpreter not found: {python_path}")
+        previous = output_snapshot(parser_dir)
+        task["status"] = "running"
+        process = await asyncio.create_subprocess_exec(
+            str(python_path), "run.py", mode, "--query", query,
+            "--location", location, "--limit", str(limit),
+            cwd=str(parser_dir), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
+        task["process"] = process
+        while chunk := await process.stdout.read(8192):
+            task["output"] = (task["output"] + chunk.decode("utf-8", errors="replace"))[-MAX_TASK_OUTPUT_CHARS:]
+        await process.wait()
+        if process.returncode != 0:
+            task["status"] = "failed"
+            return
+        changed = [path for path, signature in output_snapshot(parser_dir).items()
+                   if previous.get(path) != signature]
+        await import_csv_leads(sorted(changed))
+        task["status"] = "completed"
+    except asyncio.CancelledError:
+        task["status"] = "stopped"
+        raise
+    except Exception as error:
+        logger.exception("Parser task %s failed", task_id)
+        task["status"] = "error"
+        task["output"] = (task["output"] + f"\nTask failed: {error}")[-MAX_TASK_OUTPUT_CHARS:]
+    finally:
+        await terminate_process(process)
+        task["process"] = None
 
-        tasks[task_id]["process"] = process
 
-        output_lines = []
-        output_size = 0
-        for line in process.stdout:
-            output_lines.append(line)
-            output_size += len(line)
-            while output_size > MAX_TASK_OUTPUT_CHARS and output_lines:
-                output_size -= len(output_lines.pop(0))
-            tasks[task_id]["output"] = "".join(output_lines)
-
-        process.wait()
-
-        if process.returncode == 0:
-            tasks[task_id]["status"] = "completed"
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(import_csv_leads(parser_dir))
-            loop.close()
-        else:
-            tasks[task_id]["status"] = "failed"
-
-    except Exception as e:
-        tasks[task_id]["status"] = "error"
-        tasks[task_id]["output"] = str(e)
+async def cancel_parser_tasks():
+    workers = [task["worker"] for task in tasks.values()
+               if task.get("worker") and not task["worker"].done()]
+    for task in tasks.values():
+        if task["status"] in ACTIVE_STATUSES:
+            task["status"] = "stopped"
+    for worker in workers:
+        worker.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
 
 
 @router.post("/run", response_model=TaskResponse)
-async def run_parser(
-    request: ParserRunRequest,
-    current_user: User = Depends(require_admin),
-):
+async def run_parser(request: ParserRunRequest, current_user: User = Depends(require_admin)):
+    # The CLI shares its out directory and registry; concurrent runs would mix data.
+    if any(task["status"] in ACTIVE_STATUSES or
+           (task.get("worker") and not task["worker"].done()) for task in tasks.values()):
+        raise HTTPException(status_code=409, detail="Another parser task is active")
+    while len(tasks) >= MAX_TASK_HISTORY:
+        del tasks[next(iter(tasks))]
     task_id = str(uuid.uuid4())
-    tasks[task_id] = {
-        "status": "pending",
-        "output": "",
-        "started_at": datetime.now().isoformat(),
-        "mode": request.mode,
-        "process": None,
+    task = tasks[task_id] = {
+        "status": "pending", "output": "", "started_at": datetime.now(timezone.utc).isoformat(),
+        "mode": request.mode, "process": None,
     }
-
-    thread = threading.Thread(
-        target=run_parser_task,
-        args=(task_id, request.query, request.location, request.limit, request.mode),
-        daemon=True,
+    task["worker"] = asyncio.create_task(
+        run_parser_task(task_id, request.query, request.location, request.limit, request.mode)
     )
-    thread.start()
-
-    return TaskResponse(
-        task_id=task_id,
-        status="pending",
-        started_at=tasks[task_id]["started_at"],
-        mode=request.mode,
-    )
+    return TaskResponse(task_id=task_id, status="pending", started_at=task["started_at"], mode=request.mode)
 
 
 @router.get("/tasks", response_model=list[TaskResponse])
-async def list_tasks(current_user: User = Depends(get_current_user)):
-    return [
-        TaskResponse(
-            task_id=task_id,
-            status=task["status"],
-            started_at=task["started_at"],
-            mode=task["mode"],
-            output=None,
-        )
-        for task_id, task in tasks.items()
-    ]
+async def list_tasks(current_user: User = Depends(require_admin)):
+    return [TaskResponse(task_id=task_id, status=task["status"], started_at=task["started_at"],
+                         mode=task["mode"]) for task_id, task in tasks.items()]
 
 
 @router.get("/tasks/{task_id}", response_model=TaskResponse)
-async def get_task(task_id: str, current_user: User = Depends(get_current_user)):
+async def get_task(task_id: str, current_user: User = Depends(require_admin)):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
-
     task = tasks[task_id]
-    return TaskResponse(
-        task_id=task_id,
-        status=task["status"],
-        started_at=task["started_at"],
-        mode=task["mode"],
-        output=task["output"],
-    )
+    return TaskResponse(task_id=task_id, status=task["status"], started_at=task["started_at"],
+                        mode=task["mode"], output=task["output"])
 
 
 @router.post("/stop/{task_id}")
 async def stop_task(task_id: str, current_user: User = Depends(require_admin)):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
-
     task = tasks[task_id]
-    process = task.get("process")
-
-    if not process or task["status"] != "running":
+    worker = task.get("worker")
+    if not worker or worker.done() or task["status"] not in ACTIVE_STATUSES:
         raise HTTPException(status_code=400, detail="Task is not running")
-
-    process.terminate()
     task["status"] = "stopped"
-
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
     return {"message": "Task stopped"}

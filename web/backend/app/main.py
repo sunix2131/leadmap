@@ -28,7 +28,13 @@ async def lifespan(app: FastAPI):
             db.add(admin)
             await db.commit()
 
-    yield
+    try:
+        yield
+    finally:
+        from app.routers.parser_router import cancel_parser_tasks
+        from app.database import engine
+        await cancel_parser_tasks()
+        await engine.dispose()
 
 
 Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
